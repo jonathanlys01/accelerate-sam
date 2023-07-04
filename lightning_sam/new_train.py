@@ -28,6 +28,18 @@ from tqdm import tqdm
 
 torch.set_float32_matmul_precision('high')
 
+"""
+intersection = torch.sum(torch.mul(pred_mask, gt_mask), dim=(1, 2))
+union = torch.sum(pred_mask, dim=(1, 2)) + torch.sum(gt_mask, dim=(1, 2)) - intersection
+"""
+
+def calc_iou_single(pred_mask: torch.Tensor, gt_mask: torch.Tensor):
+    pred_mask = (pred_mask >= 0.5).float()
+    union = (pred_mask + gt_mask).sum()
+    intersection = (pred_mask * gt_mask).sum()
+    epsilon = 1e-7
+    iou = (intersection + epsilon) / (union + epsilon)
+    return iou
 
 def validate(cfg : Box,
              accelerator: Accelerator, 
@@ -78,14 +90,9 @@ def validate_per_class(cfg : Box,
     # extract classes from dataset
 
     dict_classes = val_dataloader.dataset.coco.cats
-    print({id: dict_classes[id]['name'] for id in dict_classes.keys()})
+    accelerator.print({id: dict_classes[id]['name'] for id in dict_classes.keys()})
 
-
-
-    dict_ious = {id: AverageMeter() for id in dict_classes.keys()}
-    dict_f1_scores = {id: AverageMeter() for id in dict_classes.keys()}
-
-
+    dict_ious = {id: [] for id in dict_classes.keys()}
 
     with torch.inference_mode():
         for iter, data in enumerate(val_dataloader):
@@ -93,37 +100,36 @@ def validate_per_class(cfg : Box,
             num_images = images.size(0)
             pred_masks, _ = model(images, bboxes)
             for pred_mask, gt_mask, class_id in zip(pred_masks, gt_masks, classes):
-                batch_stats = smp.metrics.get_stats(
-                    pred_mask,
-                    gt_mask.int(),
-                    mode='binary',
-                    threshold=0.5,
-                )
-                batch_iou = smp.metrics.iou_score(*batch_stats, reduction="micro-imagewise")
-                batch_f1 = smp.metrics.f1_score(*batch_stats, reduction="micro-imagewise")
-                dict_ious[class_id].update(batch_iou, num_images)
-                dict_f1_scores[class_id].update(batch_f1, num_images)
+                
+                # pred mask represents several masks for 1 given image
+                # we need to separate the classes
+
+                for prediction, gt, id in zip(pred_mask, gt_mask, class_id):
+                    iou = calc_iou_single(prediction, gt)
+                    id = int(id.detach().cpu().numpy())
+                    dict_ious[id].append(iou)
 
             if iter % cfg.val_log_interval == 0:
-                iou_avg = sum([iou.avg for iou in dict_ious])/len(dict_ious)
-                f1_avg = sum([f1.avg for f1 in dict_f1_scores])/len(dict_f1_scores)
+                iou_avg = sum([sum(list_iou)/len(list_iou) for list_iou in dict_ious.values() if len(list_iou) > 0])/len([list_iou for list_iou in dict_ious.values() if len(list_iou) > 0])
+                 
                 accelerator.print(
-                    f'Val: [{epoch}] - [{iter}/{len(val_dataloader)}]: Mean IoU: [{iou_avg:.4f}] -- Mean F1: [{f1_avg.avg:.4f}]'
+                    f'Val: [{epoch}] - [{iter}/{len(val_dataloader)}]: Mean IoU: [{iou_avg:.4f}]'
                 )
-    iou_avg = sum([iou.avg for iou in dict_ious])/len(dict_ious)
-    f1_avg = sum([f1.avg for f1 in dict_f1_scores])/len(dict_f1_scores)
-    accelerator.print(f'Validation [{epoch}]: Mean IoU: [{iou_avg:.4f}] -- Mean F1: [{f1_avg:.4f}]')
+    iou_avg = sum([sum(list_iou)/len(list_iou) for list_iou in dict_ious.values()])/len(dict_ious)
+
+    accelerator.print(f'Validation [{epoch}]: Mean IoU: [{iou_avg:.4f}] ')
 
     accelerator.print("Eval per class:")
     for id in dict_classes.keys():
         class_name = dict_classes[id]['name']
-        accelerator.print(f"Class {class_name}: Mean IoU: [{dict_ious[id].avg:.4f}] -- Mean F1: [{dict_f1_scores[id].avg:.4f}]")
+        accelerator.print(f"{class_name}: {sum(dict_ious[id])/len(dict_ious[id])}")
+
 
 
     accelerator.print(f"Saving checkpoint to {cfg.out_dir}")
     state_dict = model.model.state_dict()
     if accelerator.is_main_process:
-        torch.save(state_dict, os.path.join(cfg.out_dir, f"epoch-{epoch:06d}-f1_{f1_avg:.2f}-ckpt.pth"))
+        torch.save(state_dict, os.path.join(cfg.out_dir, f"epoch-{epoch:06d}-miou_{iou_avg:.4f}-ckpt.pth"))
         
     model.train()
 
@@ -164,9 +170,9 @@ def train_sam(
                 pred_masks, iou_predictions = model(images, bboxes)
                 num_masks = sum(len(pred_mask) for pred_mask in pred_masks)
             
-                loss_focal = torch.tensor(0.)
-                loss_dice = torch.tensor(0.)
-                loss_iou = torch.tensor(0.)
+                loss_focal = torch.tensor(0., device=accelerator.device)
+                loss_dice = torch.tensor(0., device=accelerator.device)
+                loss_iou = torch.tensor(0., device=accelerator.device)
                 for pred_mask, gt_mask, iou_prediction in zip(pred_masks, gt_masks, iou_predictions):
                     batch_iou = calc_iou(pred_mask, gt_mask)
                     loss_focal += focal_loss(pred_mask, gt_mask, num_masks)
@@ -236,8 +242,8 @@ def main(cfg: Box, accelerator: Accelerator) -> None:
     )
 
     print("First validation...")
-    #validate(cfg, accelerator, model, val_data, epoch=0)
-    validate_per_class(cfg, accelerator, model, val_data, epoch=0)
+    validate(cfg, accelerator, model, val_data, epoch=0)
+    #validate_per_class(cfg, accelerator, model, val_data, epoch=0)
     print("Training...")
     train_sam(cfg, accelerator, model, optimizer, scheduler, train_data, val_data)
     print("Validating...")
