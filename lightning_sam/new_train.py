@@ -1,0 +1,250 @@
+"""
+Replace the lightning module with Accelerate (HuggingFace) 
+"""
+
+import os
+import time
+
+"""import lightning as L
+from lightning.fabric.fabric import _FabricOptimizer
+from lightning.fabric.loggers import TensorBoardLogger"""
+
+from accelerate import Accelerator 
+from accelerate.utils import set_seed
+
+import segmentation_models_pytorch as smp
+import torch
+import torch.nn.functional as F
+from box import Box
+from config import cfg
+from dataset import load_datasets
+from losses import DiceLoss
+from losses import FocalLoss
+from new_model import Model
+from torch.utils.data import DataLoader
+from utils import AverageMeter
+from utils import calc_iou
+from tqdm import tqdm
+
+torch.set_float32_matmul_precision('high')
+
+
+def validate(cfg : Box,
+             accelerator: Accelerator, 
+             model: Model, 
+             val_dataloader: DataLoader, 
+             epoch: int = 0):
+    model.eval()
+    ious = AverageMeter()
+    f1_scores = AverageMeter()
+
+    with torch.inference_mode():
+        for iter, data in enumerate(val_dataloader):
+            images, bboxes, gt_masks, _ = data # classes are not used in normal validation
+            num_images = images.size(0)
+            pred_masks, _ = model(images, bboxes)
+            for pred_mask, gt_mask in zip(pred_masks, gt_masks):
+                batch_stats = smp.metrics.get_stats(
+                    pred_mask,
+                    gt_mask.int(),
+                    mode='binary',
+                    threshold=0.5,
+                )
+                batch_iou = smp.metrics.iou_score(*batch_stats, reduction="micro-imagewise")
+                batch_f1 = smp.metrics.f1_score(*batch_stats, reduction="micro-imagewise")
+                ious.update(batch_iou, num_images)
+                f1_scores.update(batch_f1, num_images)
+            if iter % cfg.val_log_interval == 0:
+                accelerator.print(
+                    f'Val: [{epoch}] - [{iter}/{len(val_dataloader)}]: Mean IoU: [{ious.avg:.4f}] -- Mean F1: [{f1_scores.avg:.4f}]'
+                )
+
+    accelerator.print(f'Validation [{epoch}]: Mean IoU: [{ious.avg:.4f}] -- Mean F1: [{f1_scores.avg:.4f}]')
+
+    accelerator.print(f"Saving checkpoint to {cfg.out_dir}")
+    state_dict = model.model.state_dict()
+    if accelerator.is_main_process:
+        torch.save(state_dict, os.path.join(cfg.out_dir, f"epoch-{epoch:06d}-f1_{f1_scores.avg:.2f}-ckpt.pth"))
+        
+    model.train()
+
+def validate_per_class(cfg : Box,
+             accelerator: Accelerator, 
+             model: Model, 
+             val_dataloader: DataLoader, 
+             epoch: int = 0):
+    model.eval()
+    
+    # extract classes from dataset
+
+    dict_classes = val_dataloader.dataset.coco.cats
+    print({id: dict_classes[id]['name'] for id in dict_classes.keys()})
+
+
+
+    dict_ious = {id: AverageMeter() for id in dict_classes.keys()}
+    dict_f1_scores = {id: AverageMeter() for id in dict_classes.keys()}
+
+
+
+    with torch.inference_mode():
+        for iter, data in enumerate(val_dataloader):
+            images, bboxes, gt_masks, classes = data
+            num_images = images.size(0)
+            pred_masks, _ = model(images, bboxes)
+            for pred_mask, gt_mask, class_id in zip(pred_masks, gt_masks, classes):
+                batch_stats = smp.metrics.get_stats(
+                    pred_mask,
+                    gt_mask.int(),
+                    mode='binary',
+                    threshold=0.5,
+                )
+                batch_iou = smp.metrics.iou_score(*batch_stats, reduction="micro-imagewise")
+                batch_f1 = smp.metrics.f1_score(*batch_stats, reduction="micro-imagewise")
+                dict_ious[class_id].update(batch_iou, num_images)
+                dict_f1_scores[class_id].update(batch_f1, num_images)
+
+            if iter % cfg.val_log_interval == 0:
+                iou_avg = sum([iou.avg for iou in dict_ious])/len(dict_ious)
+                f1_avg = sum([f1.avg for f1 in dict_f1_scores])/len(dict_f1_scores)
+                accelerator.print(
+                    f'Val: [{epoch}] - [{iter}/{len(val_dataloader)}]: Mean IoU: [{iou_avg:.4f}] -- Mean F1: [{f1_avg.avg:.4f}]'
+                )
+    iou_avg = sum([iou.avg for iou in dict_ious])/len(dict_ious)
+    f1_avg = sum([f1.avg for f1 in dict_f1_scores])/len(dict_f1_scores)
+    accelerator.print(f'Validation [{epoch}]: Mean IoU: [{iou_avg:.4f}] -- Mean F1: [{f1_avg:.4f}]')
+
+    accelerator.print("Eval per class:")
+    for id in dict_classes.keys():
+        class_name = dict_classes[id]['name']
+        accelerator.print(f"Class {class_name}: Mean IoU: [{dict_ious[id].avg:.4f}] -- Mean F1: [{dict_f1_scores[id].avg:.4f}]")
+
+
+    accelerator.print(f"Saving checkpoint to {cfg.out_dir}")
+    state_dict = model.model.state_dict()
+    if accelerator.is_main_process:
+        torch.save(state_dict, os.path.join(cfg.out_dir, f"epoch-{epoch:06d}-f1_{f1_avg:.2f}-ckpt.pth"))
+        
+    model.train()
+
+def train_sam(
+    cfg: Box,
+    accelerator: Accelerator,
+    model: Model,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler._LRScheduler,
+    train_dataloader: DataLoader,
+    val_dataloader: DataLoader,
+):
+    """The SAM training loop."""
+
+    focal_loss = FocalLoss()
+    dice_loss = DiceLoss()
+
+    for epoch in range(1, cfg.num_epochs):
+        batch_time = AverageMeter()
+        data_time = AverageMeter()
+        focal_losses = AverageMeter()
+        dice_losses = AverageMeter()
+        iou_losses = AverageMeter()
+        total_losses = AverageMeter()
+        end = time.time()
+        validated = False
+
+        for iter, data in tqdm(enumerate(train_dataloader),total=len(train_dataloader)):
+            if epoch > 1 and epoch % cfg.eval_interval == 0 and not validated:
+                    validate(cfg,accelerator, model, val_dataloader, epoch)
+                    validated = True
+
+            with accelerator.accumulate(model):
+                
+                data_time.update(time.time() - end)
+                images, bboxes, gt_masks, _ = data # classes are not used in normal training
+                batch_size = images.size(0)
+                pred_masks, iou_predictions = model(images, bboxes)
+                num_masks = sum(len(pred_mask) for pred_mask in pred_masks)
+            
+                loss_focal = torch.tensor(0.)
+                loss_dice = torch.tensor(0.)
+                loss_iou = torch.tensor(0.)
+                for pred_mask, gt_mask, iou_prediction in zip(pred_masks, gt_masks, iou_predictions):
+                    batch_iou = calc_iou(pred_mask, gt_mask)
+                    loss_focal += focal_loss(pred_mask, gt_mask, num_masks)
+                    loss_dice += dice_loss(pred_mask, gt_mask, num_masks)
+                    loss_iou += F.mse_loss(iou_prediction, batch_iou, reduction='sum') / num_masks # useful? 
+
+                loss_total = 20. * loss_focal + loss_dice + loss_iou
+
+                accelerator.backward(loss_total)
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
+                batch_time.update(time.time() - end)
+                end = time.time()
+
+                focal_losses.update(loss_focal.item(), batch_size)
+                dice_losses.update(loss_dice.item(), batch_size)
+                iou_losses.update(loss_iou.item(), batch_size)
+                total_losses.update(loss_total.item(), batch_size)
+
+                if iter%cfg.train_log_interval == 0:
+                    accelerator.print(f'Epoch: [{epoch}][{iter+1}/{len(train_dataloader)}]'
+                                f' | Time [{batch_time.val:.3f}s ({batch_time.avg:.3f}s)]'
+                                f' | Data [{data_time.val:.3f}s ({data_time.avg:.3f}s)]'
+                                f' | Focal Loss [{focal_losses.val:.4f} ({focal_losses.avg:.4f})]'
+                                f' | Dice Loss [{dice_losses.val:.4f} ({dice_losses.avg:.4f})]'
+                                f' | IoU Loss [{iou_losses.val:.4f} ({iou_losses.avg:.4f})]'
+                                f' | Total Loss [{total_losses.val:.4f} ({total_losses.avg:.4f})]')
+
+
+def configure_opt(cfg: Box, model: Model):
+
+    def lr_lambda(step):
+        if step < cfg.opt.warmup_steps:
+            return step / cfg.opt.warmup_steps
+        elif step < cfg.opt.steps[0]:
+            return 1.0
+        elif step < cfg.opt.steps[1]:
+            return 1 / cfg.opt.decay_factor
+        else:
+            return 1 / (cfg.opt.decay_factor**2)
+
+    optimizer = torch.optim.Adam(model.model.parameters(), lr=cfg.opt.learning_rate, weight_decay=cfg.opt.weight_decay)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+    return optimizer, scheduler
+
+
+def main(cfg: Box, accelerator: Accelerator) -> None:
+
+
+    set_seed(42)
+
+    if accelerator.is_main_process:
+        os.makedirs(cfg.out_dir, exist_ok=True)
+
+    
+    model = Model(cfg)
+    model.setup() # require_grad=False for backbone
+
+    train_data, val_data = load_datasets(cfg, model.model.image_encoder.img_size)
+
+    optimizer, scheduler = configure_opt(cfg, model)
+
+    train_data, val_data, model, optimizer, scheduler = accelerator.prepare(
+        train_data, val_data, model, optimizer, scheduler
+    )
+
+    print("First validation...")
+    #validate(cfg, accelerator, model, val_data, epoch=0)
+    validate_per_class(cfg, accelerator, model, val_data, epoch=0)
+    print("Training...")
+    train_sam(cfg, accelerator, model, optimizer, scheduler, train_data, val_data)
+    print("Validating...")
+    validate_per_class(cfg, accelerator, model, val_data, epoch=cfg.num_epochs)
+    #validate(cfg,accelerator, model, val_data, epoch=cfg.num_epochs)
+
+
+if __name__ == "__main__":
+    accelerator = Accelerator(gradient_accumulation_steps=cfg.gradient_accumulation_steps)
+    main(cfg,accelerator=accelerator)

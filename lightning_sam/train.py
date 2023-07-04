@@ -20,7 +20,11 @@ from utils import calc_iou
 torch.set_float32_matmul_precision('high')
 
 
-def validate(fabric: L.Fabric, model: Model, val_dataloader: DataLoader, epoch: int = 0):
+def validate(cfg : Box,
+             fabric: L.Fabric, 
+             model: Model, 
+             val_dataloader: DataLoader, 
+             epoch: int = 0):
     model.eval()
     ious = AverageMeter()
     f1_scores = AverageMeter()
@@ -41,9 +45,10 @@ def validate(fabric: L.Fabric, model: Model, val_dataloader: DataLoader, epoch: 
                 batch_f1 = smp.metrics.f1_score(*batch_stats, reduction="micro-imagewise")
                 ious.update(batch_iou, num_images)
                 f1_scores.update(batch_f1, num_images)
-            fabric.print(
-                f'Val: [{epoch}] - [{iter}/{len(val_dataloader)}]: Mean IoU: [{ious.avg:.4f}] -- Mean F1: [{f1_scores.avg:.4f}]'
-            )
+            if iter % cfg.val_log_interval == 0:
+                fabric.print(
+                    f'Val: [{epoch}] - [{iter}/{len(val_dataloader)}]: Mean IoU: [{ious.avg:.4f}] -- Mean F1: [{f1_scores.avg:.4f}]'
+                )
 
     fabric.print(f'Validation [{epoch}]: Mean IoU: [{ious.avg:.4f}] -- Mean F1: [{f1_scores.avg:.4f}]')
 
@@ -80,7 +85,7 @@ def train_sam(
 
         for iter, data in enumerate(train_dataloader):
             if epoch > 1 and epoch % cfg.eval_interval == 0 and not validated:
-                validate(fabric, model, val_dataloader, epoch)
+                validate(cfg,fabric, model, val_dataloader, epoch)
                 validated = True
 
             data_time.update(time.time() - end)
@@ -110,13 +115,14 @@ def train_sam(
             iou_losses.update(loss_iou.item(), batch_size)
             total_losses.update(loss_total.item(), batch_size)
 
-            fabric.print(f'Epoch: [{epoch}][{iter+1}/{len(train_dataloader)}]'
-                         f' | Time [{batch_time.val:.3f}s ({batch_time.avg:.3f}s)]'
-                         f' | Data [{data_time.val:.3f}s ({data_time.avg:.3f}s)]'
-                         f' | Focal Loss [{focal_losses.val:.4f} ({focal_losses.avg:.4f})]'
-                         f' | Dice Loss [{dice_losses.val:.4f} ({dice_losses.avg:.4f})]'
-                         f' | IoU Loss [{iou_losses.val:.4f} ({iou_losses.avg:.4f})]'
-                         f' | Total Loss [{total_losses.val:.4f} ({total_losses.avg:.4f})]')
+            if iter%cfg.train_log_interval == 0:
+                fabric.print(f'Epoch: [{epoch}][{iter+1}/{len(train_dataloader)}]'
+                            f' | Time [{batch_time.val:.3f}s ({batch_time.avg:.3f}s)]'
+                            f' | Data [{data_time.val:.3f}s ({data_time.avg:.3f}s)]'
+                            f' | Focal Loss [{focal_losses.val:.4f} ({focal_losses.avg:.4f})]'
+                            f' | Dice Loss [{dice_losses.val:.4f} ({dice_losses.avg:.4f})]'
+                            f' | IoU Loss [{iou_losses.val:.4f} ({iou_losses.avg:.4f})]'
+                            f' | Total Loss [{total_losses.val:.4f} ({total_losses.avg:.4f})]')
 
 
 def configure_opt(cfg: Box, model: Model):
@@ -158,9 +164,12 @@ def main(cfg: Box) -> None:
 
     optimizer, scheduler = configure_opt(cfg, model)
     model, optimizer = fabric.setup(model, optimizer)
-
+    print("First validation...")
+    validate(cfg, fabric, model, val_data, epoch=0)
+    print("Training...")
     train_sam(cfg, fabric, model, optimizer, scheduler, train_data, val_data)
-    validate(fabric, model, val_data, epoch=0)
+    print("Validating...")
+    validate(cfg,fabric, model, val_data, epoch=cfg.num_epochs)
 
 
 if __name__ == "__main__":

@@ -1,11 +1,14 @@
 from box import Box
-
+import os
 config = {
-    "num_devices": 4,
-    "batch_size": 12,
+    "num_devices": 1,
+    "batch_size": 6,
     "num_workers": 4,
-    "num_epochs": 20,
-    "eval_interval": 2,
+    "num_epochs": 2,
+    "gradient_accumulation_steps": 2,
+    "eval_interval": 5,
+    "train_log_interval": 100,
+    "val_log_interval": 10,
     "out_dir": "out/training",
     "opt": {
         "learning_rate": 8e-4,
@@ -15,8 +18,8 @@ config = {
         "warmup_steps": 250,
     },
     "model": {
-        "type": 'vit_h',
-        "checkpoint": "sam_vit_h_4b8939.pth",
+        "type": 'vit_b',
+        "checkpoint": "sam_vit_b_01ec64.pth",
         "freeze": {
             "image_encoder": True,
             "prompt_encoder": True,
@@ -25,12 +28,12 @@ config = {
     },
     "dataset": {
         "train": {
-            "root_dir": "/coco/coco2017/train2017",
-            "annotation_file": "/coco/coco2017/annotations/instances_train2017.json"
+            "root_dir": "/home/someone/stage_jonathan/datasets/train2017",
+            "annotation_file": "/home/someone/stage_jonathan/datasets/new_lvis_v1_train.json"
         },
         "val": {
-            "root_dir": "/coco/coco2017/val2017",
-            "annotation_file": "/coco/coco2017/annotations/instances_val2017.json"
+            "root_dir": "/home/someone/stage_jonathan/datasets/val2017",
+            "annotation_file": "/home/someone/stage_jonathan/datasets/new_lvis_v1_val.json"
         }
     }
 }

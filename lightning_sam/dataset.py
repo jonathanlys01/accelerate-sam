@@ -1,5 +1,5 @@
 import os
-
+from tqdm import tqdm
 import cv2
 import numpy as np
 import torch
@@ -9,6 +9,7 @@ from segment_anything.utils.transforms import ResizeLongestSide
 from torch.utils.data import DataLoader
 from torch.utils.data import Dataset
 
+import random as rd
 
 class COCODataset(Dataset):
 
@@ -16,10 +17,18 @@ class COCODataset(Dataset):
         self.root_dir = root_dir
         self.transform = transform
         self.coco = COCO(annotation_file)
-        self.image_ids = list(self.coco.imgs.keys())
+        #self.image_ids = list(self.coco.imgs.keys())
 
-        # Filter out image_ids without any annotations
-        self.image_ids = [image_id for image_id in self.image_ids if len(self.coco.getAnnIds(imgIds=image_id)) > 0]
+        self.image_ids = []
+
+        # some images have no annotations
+        temp = os.listdir(self.root_dir)
+        for image_id in tqdm(list(self.coco.imgs.keys())):
+            image_info = self.coco.loadImgs(image_id)[0]
+            
+            if image_info['coco_url'].split('/')[-1] in temp and len(self.coco.getAnnIds(imgIds=image_id)) > 0:
+                self.image_ids.append(image_id)
+        print("Total images:",len(self.image_ids))
 
     def __len__(self):
         return len(self.image_ids)
@@ -27,7 +36,13 @@ class COCODataset(Dataset):
     def __getitem__(self, idx):
         image_id = self.image_ids[idx]
         image_info = self.coco.loadImgs(image_id)[0]
-        image_path = os.path.join(self.root_dir, image_info['file_name'])
+
+        name = image_info['coco_url'].split('/')[-1]
+        #image_path = os.path.join(self.root_dir, image_info['file_name'])
+        
+        image_path = os.path.join(self.root_dir, name)
+
+        
         image = cv2.imread(image_path)
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
@@ -35,25 +50,33 @@ class COCODataset(Dataset):
         anns = self.coco.loadAnns(ann_ids)
         bboxes = []
         masks = []
+        classes = []
 
+        # Use only 5 annotations per image
+        if len(anns) > 5:
+            anns = rd.sample(anns, 5)
         for ann in anns:
             x, y, w, h = ann['bbox']
+            class_id = ann['category_id']
             bboxes.append([x, y, x + w, y + h])
             mask = self.coco.annToMask(ann)
             masks.append(mask)
+            classes.append(class_id)
 
         if self.transform:
             image, masks, bboxes = self.transform(image, masks, np.array(bboxes))
 
         bboxes = np.stack(bboxes, axis=0)
         masks = np.stack(masks, axis=0)
-        return image, torch.tensor(bboxes), torch.tensor(masks).float()
+        classes = np.stack(classes, axis=0)
+
+        return image, torch.tensor(bboxes), torch.tensor(masks).float(), torch.tensor(classes) # added classes
 
 
 def collate_fn(batch):
-    images, bboxes, masks = zip(*batch)
+    images, bboxes, masks, classes = zip(*batch)
     images = torch.stack(images)
-    return images, bboxes, masks
+    return images, bboxes, masks, classes
 
 
 class ResizeAndPad:
