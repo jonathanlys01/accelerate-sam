@@ -25,6 +25,7 @@ from torch.utils.data import DataLoader
 from utils import AverageMeter
 from utils import calc_iou
 from tqdm import tqdm
+import numpy as np
 
 torch.set_float32_matmul_precision('high')
 
@@ -35,7 +36,8 @@ union = torch.sum(pred_mask, dim=(1, 2)) + torch.sum(gt_mask, dim=(1, 2)) - inte
 
 def calc_iou_single(pred_mask: torch.Tensor, gt_mask: torch.Tensor):
     pred_mask = (pred_mask >= 0.5).float()
-    union = (pred_mask + gt_mask).sum()
+    # clip the values to 0 and 1
+    union = torch.clamp(pred_mask + gt_mask, 0, 1).sum()
     intersection = (pred_mask * gt_mask).sum()
     epsilon = 1e-7
     iou = (intersection + epsilon) / (union + epsilon)
@@ -73,12 +75,23 @@ def validate(cfg : Box,
 
     accelerator.print(f'Validation [{epoch}]: Mean IoU: [{ious.avg:.4f}] -- Mean F1: [{f1_scores.avg:.4f}]')
 
-    accelerator.print(f"Saving checkpoint to {cfg.out_dir}")
-    state_dict = model.model.state_dict()
-    if accelerator.is_main_process:
+    
+    if accelerator.is_main_process and cfg.save:
+        accelerator.print(f"Saving checkpoint to {cfg.out_dir}")
+        state_dict = model.model.state_dict()
         torch.save(state_dict, os.path.join(cfg.out_dir, f"epoch-{epoch:06d}-f1_{f1_scores.avg:.2f}-ckpt.pth"))
         
     model.train()
+
+
+def compute_iou_avg(dict_ious : dict):
+    all_concat = []
+    for list_iou in dict_ious.values():
+        all_concat += list_iou
+    all_concat = list(map(lambda x: float(x.cpu()), all_concat))
+    return np.mean(all_concat)
+    #return np.mean(map(lambda x: float(x.cpu()), all_concat))
+
 
 def validate_per_class(cfg : Box,
              accelerator: Accelerator, 
@@ -90,7 +103,6 @@ def validate_per_class(cfg : Box,
     # extract classes from dataset
 
     dict_classes = val_dataloader.dataset.coco.cats
-    accelerator.print({id: dict_classes[id]['name'] for id in dict_classes.keys()})
 
     dict_ious = {id: [] for id in dict_classes.keys()}
 
@@ -110,25 +122,28 @@ def validate_per_class(cfg : Box,
                     dict_ious[id].append(iou)
 
             if iter % cfg.val_log_interval == 0:
-                iou_avg = sum([sum(list_iou)/len(list_iou) for list_iou in dict_ious.values() if len(list_iou) > 0])/len([list_iou for list_iou in dict_ious.values() if len(list_iou) > 0])
+                iou_avg = compute_iou_avg(dict_ious)
                  
                 accelerator.print(
                     f'Val: [{epoch}] - [{iter}/{len(val_dataloader)}]: Mean IoU: [{iou_avg:.4f}]'
                 )
-    iou_avg = sum([sum(list_iou)/len(list_iou) for list_iou in dict_ious.values()])/len(dict_ious)
+    iou_avg = compute_iou_avg(dict_ious)
 
     accelerator.print(f'Validation [{epoch}]: Mean IoU: [{iou_avg:.4f}] ')
 
     accelerator.print("Eval per class:")
+    accelerator.print('{:^20} | {:^20}'.format('Class', 'IoU'))
+    accelerator.print('-' * 42)
     for id in dict_classes.keys():
         class_name = dict_classes[id]['name']
-        accelerator.print(f"{class_name}: {sum(dict_ious[id])/len(dict_ious[id])}")
+        avg = round(float(sum(dict_ious[id]) / len(dict_ious[id])),5)
+        accelerator.print('{:^20} | {:^20}'.format(class_name, avg))
+    accelerator.print('-' * 42)
+    accelerator.print('{:^20} | {:^20}'.format('Mean', iou_avg))
 
-
-
-    accelerator.print(f"Saving checkpoint to {cfg.out_dir}")
-    state_dict = model.model.state_dict()
-    if accelerator.is_main_process:
+    if accelerator.is_main_process and cfg.save:
+        accelerator.print(f"Saving checkpoint to {cfg.out_dir}")
+        state_dict = model.model.state_dict()
         torch.save(state_dict, os.path.join(cfg.out_dir, f"epoch-{epoch:06d}-miou_{iou_avg:.4f}-ckpt.pth"))
         
     model.train()
@@ -242,13 +257,13 @@ def main(cfg: Box, accelerator: Accelerator) -> None:
     )
 
     print("First validation...")
-    validate(cfg, accelerator, model, val_data, epoch=0)
-    #validate_per_class(cfg, accelerator, model, val_data, epoch=0)
+    #validate(cfg, accelerator, model, val_data, epoch=0)
+    validate_per_class(cfg, accelerator, model, val_data, epoch=0)
     print("Training...")
     train_sam(cfg, accelerator, model, optimizer, scheduler, train_data, val_data)
     print("Validating...")
-    validate_per_class(cfg, accelerator, model, val_data, epoch=cfg.num_epochs)
     #validate(cfg,accelerator, model, val_data, epoch=cfg.num_epochs)
+    validate_per_class(cfg, accelerator, model, val_data, epoch=cfg.num_epochs)
 
 
 if __name__ == "__main__":
