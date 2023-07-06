@@ -158,6 +158,7 @@ cython_debug/
 # User-specific stuff
 lightning_sam/config.py
 
+embeddings/
 
 # PyCharm
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can

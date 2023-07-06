@@ -25,8 +25,8 @@ class COCODataset(Dataset):
         temp = os.listdir(self.root_dir)
         for image_id in tqdm(list(self.coco.imgs.keys())):
             image_info = self.coco.loadImgs(image_id)[0]
-            
-            if image_info['coco_url'].split('/')[-1] in temp and len(self.coco.getAnnIds(imgIds=image_id)) > 0:
+            name = image_info['coco_url'].split('/')[-1]
+            if name in temp and len(self.coco.getAnnIds(imgIds=image_id)) > 0:
                 self.image_ids.append(image_id)
         print("Total images:",len(self.image_ids))
 
