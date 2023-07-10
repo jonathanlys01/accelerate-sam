@@ -1,5 +1,11 @@
+"""
+Derived from new_train.py.
+Uses automatic mask generator model instead of new_model.Model. WIP !!!!!!
+"""
+
 import os
 import time
+
 
 
 from accelerate import Accelerator 
@@ -10,10 +16,12 @@ import torch
 import torch.nn.functional as F
 from box import Box
 from config import cfg
-from embed_dataset import load_embed_datasets
+from dataset import load_datasets
 from losses import DiceLoss
 from losses import FocalLoss
-from embed_model import TopModel
+from new_model import Model
+from segment_anything import sam_model_registry, SamAutomaticMaskGenerator
+from segment_anything.modeling import Sam
 from torch.utils.data import DataLoader
 from utils import AverageMeter
 from utils import calc_iou
@@ -22,14 +30,11 @@ import numpy as np
 
 torch.set_float32_matmul_precision('high')
 
-"""
-intersection = torch.sum(torch.mul(pred_mask, gt_mask), dim=(1, 2))
-union = torch.sum(pred_mask, dim=(1, 2)) + torch.sum(gt_mask, dim=(1, 2)) - intersection
-"""
 
-def calc_iou_single(pred_mask: torch.Tensor, gt_mask: torch.Tensor):
-    pred_mask = (pred_mask >= 0.5).float()
+def calc_iou_single(pred_mask: np.ndarray, gt_mask: torch.Tensor):
+    # when using automatic mask generator, the output is already a mask
     # clip the values to 0 and 1
+    pred_mask = torch.from_numpy(pred_mask).float()
     union = torch.clamp(pred_mask + gt_mask, 0, 1).sum()
     intersection = (pred_mask * gt_mask).sum()
     epsilon = 1e-7
@@ -38,34 +43,49 @@ def calc_iou_single(pred_mask: torch.Tensor, gt_mask: torch.Tensor):
 
 def validate(cfg : Box,
              accelerator: Accelerator, 
-             model: TopModel, 
+             MG: SamAutomaticMaskGenerator,
              val_dataloader: DataLoader, 
              epoch: int = 0):
-    model.eval()
+    MG.predictor.model.eval()
     ious = AverageMeter()
     f1_scores = AverageMeter()
 
     with torch.inference_mode():
-        for iter, data in enumerate(val_dataloader):
+        for iter, data in tqdm(enumerate(val_dataloader), total=len(val_dataloader)):
 
-            # modified to fit the embed_dataset
-            embedings, bboxes, gt_masks, _, points = data # classes are not used in normal validation 
-            num_images = cfg.batch_size
+            batch_images, batch_bboxes, batch_gt_masks, _ = data # classes not used 
+            
+            for image, _ , gt_masks in zip(batch_images, batch_bboxes, batch_gt_masks): # bbox not used
 
-            pred_masks, _ = model(embedings, bboxes,points)
+                image_numpy = image.cpu().numpy().transpose(1,2,0).astype(np.uint8) # HWC to CHW
+                outputs = MG.generate(image_numpy)
+                pred_masks = [output['segmentation'] for output in outputs]
+                gt_masks = gt_masks.cpu()
 
-            for pred_mask, gt_mask in zip(pred_masks, gt_masks):
+                if len(pred_masks) == 0:
+                    print("No masks found")
+                    continue
 
-                batch_stats = smp.metrics.get_stats(
-                    pred_mask,
-                    gt_mask.int(),
-                    mode='binary',
-                    threshold=0.5,
-                )
-                batch_iou = smp.metrics.iou_score(*batch_stats, reduction="micro-imagewise")
-                batch_f1 = smp.metrics.f1_score(*batch_stats, reduction="micro-imagewise")
-                ious.update(batch_iou, num_images)
-                f1_scores.update(batch_f1, num_images)
+                filtered_pred_masks = filter_masks(pred_masks,gt_masks)
+
+                if len(filtered_pred_masks) != len(gt_masks):
+                    print(f"Filtered pred masks: {len(filtered_pred_masks)}")
+                    print(f"GT masks: {len(gt_masks)}")
+                    print("Skipping this image")
+                    continue
+
+                
+                for pred_mask, gt_mask in zip(filtered_pred_masks, gt_masks):
+                    batch_stats = smp.metrics.get_stats(
+                        torch.from_numpy(pred_mask),
+                        gt_mask.int(),
+                        mode='binary',
+                        threshold=0.5,
+                    )
+                    batch_iou = smp.metrics.iou_score(*batch_stats, reduction="micro-imagewise")
+                    batch_f1 = smp.metrics.f1_score(*batch_stats, reduction="micro-imagewise")
+                    ious.update(batch_iou, 1) # only one image
+                    f1_scores.update(batch_f1, 1)
             if iter % cfg.val_log_interval == 0:
                 accelerator.print(
                     f'Val: [{epoch}] - [{iter}/{len(val_dataloader)}]: Mean IoU: [{ious.avg:.4f}] -- Mean F1: [{f1_scores.avg:.4f}]'
@@ -76,10 +96,10 @@ def validate(cfg : Box,
     
     if accelerator.is_main_process and cfg.save:
         accelerator.print(f"Saving checkpoint to {cfg.out_dir}")
-        state_dict = model.model.state_dict()
+        state_dict = MG.predictor.model.state_dict()
         torch.save(state_dict, os.path.join(cfg.out_dir, f"epoch-{epoch:06d}-f1_{f1_scores.avg:.2f}-ckpt.pth"))
         
-    model.train()
+    MG.predictor.model.train()
 
 
 def compute_iou_avg(dict_ious : dict):
@@ -93,9 +113,10 @@ def compute_iou_avg(dict_ious : dict):
 
 def validate_per_class(cfg : Box,
              accelerator: Accelerator, 
-             model: TopModel, 
+             MG: SamAutomaticMaskGenerator, 
              val_dataloader: DataLoader, 
              epoch: int = 0):
+    model = MG.predictor.model
     model.eval()
     
     # extract classes from dataset
@@ -106,12 +127,9 @@ def validate_per_class(cfg : Box,
 
     with torch.inference_mode():
         for iter, data in enumerate(val_dataloader):
-
-            embedings, bboxes, gt_masks, classes, points = data # classes are not used in normal validation
-
-            pred_masks, _ = model(embedings, bboxes, points)
-
-            
+            images, bboxes, gt_masks, classes = data
+            num_images = images.size(0)
+            pred_masks, _ = model(images, bboxes)
             for pred_mask, gt_mask, class_id in zip(pred_masks, gt_masks, classes):
                 
                 # pred mask represents several masks for 1 given image
@@ -133,14 +151,14 @@ def validate_per_class(cfg : Box,
     accelerator.print(f'Validation [{epoch}]: Mean IoU: [{iou_avg:.4f}] ')
 
     accelerator.print("Eval per class:")
-    accelerator.print('{:^30} | {:^20}'.format('Class', 'IoU'))
-    accelerator.print('-' * 52)
+    accelerator.print('{:^20} | {:^20}'.format('Class', 'IoU'))
+    accelerator.print('-' * 42)
     for id in dict_classes.keys():
         class_name = dict_classes[id]['name']
         avg = round(float(sum(dict_ious[id]) / len(dict_ious[id])),5)
-        accelerator.print('{:^30} | {:^20}'.format(class_name, avg))
-    accelerator.print('-' * 52)
-    accelerator.print('{:^30} | {:^20}'.format('Mean', iou_avg))
+        accelerator.print('{:^20} | {:^20}'.format(class_name, avg))
+    accelerator.print('-' * 42)
+    accelerator.print('{:^20} | {:^20}'.format('Mean', iou_avg))
 
     if accelerator.is_main_process and cfg.save:
         accelerator.print(f"Saving checkpoint to {cfg.out_dir}")
@@ -152,13 +170,14 @@ def validate_per_class(cfg : Box,
 def train_sam(
     cfg: Box,
     accelerator: Accelerator,
-    model: TopModel,
+    MG: SamAutomaticMaskGenerator,
     optimizer: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler._LRScheduler,
     train_dataloader: DataLoader,
     val_dataloader: DataLoader,
 ):
     """The SAM training loop."""
+    model = MG.predictor.model
 
     focal_loss = FocalLoss()
     dice_loss = DiceLoss()
@@ -181,24 +200,21 @@ def train_sam(
             with accelerator.accumulate(model):
                 
                 data_time.update(time.time() - end)
+                images, bboxes, gt_masks, _ = data # classes are not used in normal training
+                batch_size = images.size(0)
+                pred_masks, iou_predictions = model(images, bboxes)
+                num_masks = sum(len(pred_mask) for pred_mask in pred_masks)
+            
+                loss_focal = torch.tensor(0., device=accelerator.device)
+                loss_dice = torch.tensor(0., device=accelerator.device)
+                loss_iou = torch.tensor(0., device=accelerator.device)
+                for pred_mask, gt_mask, iou_prediction in zip(pred_masks, gt_masks, iou_predictions):
+                    batch_iou = calc_iou(pred_mask, gt_mask)
+                    loss_focal += focal_loss(pred_mask, gt_mask, num_masks)
+                    loss_dice += dice_loss(pred_mask, gt_mask, num_masks)
+                    loss_iou += F.mse_loss(iou_prediction, batch_iou, reduction='sum') / num_masks # useful? 
 
-                embedings, bboxes, gt_masks, _, points = data # classes are not used in normal validation 
-                batch_size = cfg.batch_size
-                with torch.cuda.amp.autocast(): # mixed precision
-                    pred_masks, iou_predictions = model(embedings, bboxes, points)
-
-                    num_masks = sum(len(pred_mask) for pred_mask in pred_masks)
-                
-                    loss_focal = torch.tensor(0., device=accelerator.device)
-                    loss_dice = torch.tensor(0., device=accelerator.device)
-                    loss_iou = torch.tensor(0., device=accelerator.device)
-                    for pred_mask, gt_mask, iou_prediction in zip(pred_masks, gt_masks, iou_predictions):
-                        batch_iou = calc_iou(pred_mask, gt_mask)
-                        loss_focal += focal_loss(pred_mask, gt_mask, num_masks)
-                        loss_dice += dice_loss(pred_mask, gt_mask, num_masks)
-                        loss_iou += F.mse_loss(iou_prediction, batch_iou, reduction='sum') / num_masks # useful? 
-
-                    loss_total = loss_focal + loss_dice + loss_iou
+                loss_total = 20. * loss_focal + loss_dice + loss_iou
 
                 accelerator.backward(loss_total)
                 optimizer.step()
@@ -222,7 +238,7 @@ def train_sam(
                                 f' | Total Loss [{total_losses.val:.4f} ({total_losses.avg:.4f})]')
 
 
-def configure_opt(cfg: Box, model: TopModel):
+def configure_opt(cfg: Box, MG: SamAutomaticMaskGenerator):
 
     def lr_lambda(step):
         if step < cfg.opt.warmup_steps:
@@ -233,29 +249,45 @@ def configure_opt(cfg: Box, model: TopModel):
             return 1 / cfg.opt.decay_factor
         else:
             return 1 / (cfg.opt.decay_factor**2)
-
-    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.opt.learning_rate, weight_decay=cfg.opt.weight_decay)
+    optimizer = torch.optim.Adam(MG.predictor.model.mask_decoder.parameters(),
+                                 lr=cfg.opt.learning_rate, 
+                                 weight_decay=cfg.opt.weight_decay)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     return optimizer, scheduler
 
 
+def setup_sam(sam_model:Sam,cfg:Box):
+    sam_model.train()
+    if cfg.model.freeze.image_encoder:
+        for param in sam_model.image_encoder.parameters():
+            param.requires_grad = False
+    if cfg.model.freeze.prompt_encoder:
+        for param in sam_model.prompt_encoder.parameters():
+            param.requires_grad = False
+    if cfg.model.freeze.mask_decoder:
+        for param in sam_model.mask_decoder.parameters():
+            param.requires_grad = False
+    return sam_model
+
+
 def main(cfg: Box, accelerator: Accelerator) -> None:
 
 
-    set_seed(1337)
+    set_seed(42)
 
     if accelerator.is_main_process:
         os.makedirs(cfg.out_dir, exist_ok=True)
 
+    sam_model = sam_model_registry[cfg.model.type](checkpoint=cfg.model.checkpoint)
+
+    sam_model = setup_sam(sam_model,cfg)
+
+    model = SamAutomaticMaskGenerator(sam_model)
+
+    model.predictor.model.to(accelerator.device)
     
-    model = TopModel(cfg)
-
-    print("Model loaded")
-    #model.setup() # not required because already done in __init__
-
-
-    train_data, val_data = load_embed_datasets(cfg)
+    train_data, val_data = load_datasets(cfg, 1024) # hardcoded img size
 
     optimizer, scheduler = configure_opt(cfg, model)
 
@@ -263,18 +295,45 @@ def main(cfg: Box, accelerator: Accelerator) -> None:
         train_data, val_data, model, optimizer, scheduler
     )
 
-    print("First validation")
-    #validate(cfg, accelerator, model, val_data, epoch=0)
+    print("First validation...")
+    validate(cfg, accelerator, model, val_data, epoch=0)
+    
+    exit() # only validate for now
     validate_per_class(cfg, accelerator, model, val_data, epoch=0)
-
-    print("Training")
+    print("Training...")
     train_sam(cfg, accelerator, model, optimizer, scheduler, train_data, val_data)
-    print("Last validation")
+    print("Validating...")
     #validate(cfg,accelerator, model, val_data, epoch=cfg.num_epochs)
     validate_per_class(cfg, accelerator, model, val_data, epoch=cfg.num_epochs)
 
 
-if __name__ == "__main__":
+def select_mask_from_label(pred_masks, gt_mask):
+    """
+    Selects the mask from the predicted masks that has the highest IoU with the ground truth mask.
+    """
+    temp = []
+    for i, pred_mask in enumerate(pred_masks):
+        iou = calc_iou_single(pred_mask, gt_mask)
+        temp.append((iou, i))
+    idx = max(temp)[1]
+    if len(pred_masks):
+        highest_mask = pred_masks[idx]
+    return highest_mask
 
+def filter_masks(pred_masks, gt_masks):
+    """
+    Filters the predicted masks by selecting the mask with the highest IoU with the ground truth mask.
+    """
+    filtered_masks = []
+    for gt_mask in gt_masks:
+        highest_mask = select_mask_from_label(pred_masks, gt_mask)
+        filtered_masks.append(highest_mask)
+    del pred_masks
+    return filtered_masks
+
+
+        
+
+if __name__ == "__main__":
     accelerator = Accelerator(gradient_accumulation_steps=cfg.gradient_accumulation_steps)
     main(cfg,accelerator=accelerator)

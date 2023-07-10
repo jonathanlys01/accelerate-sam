@@ -3,6 +3,7 @@ import torch
 from segment_anything import sam_model_registry
 from copy import deepcopy
 import torch.nn.functional as F
+import numpy as np
 
 class EncoderModel(nn.Module):
 
@@ -56,16 +57,20 @@ class TopModel(nn.Module):
         self.prompt_encoder.train()
         self.mask_decoder.train()
     
-    def forward(self, image_embeddings, bboxes):
+    def forward(self, image_embeddings, bboxes, points=None):
+
         H, W = 1024, 1024 # hardcoded
 
         pred_masks = []
         ious = []
-        for embedding, bbox in zip(image_embeddings, bboxes):
-            with torch.inference_mode():
+        for embedding, bbox, point in zip(image_embeddings, bboxes, points):
+            with torch.inference_mode():           
+                point_and_label = (point.unsqueeze(1),
+                                   torch.tensor(1,device=point.device).repeat(point.shape[0]).unsqueeze(1)) # add a dimension in the second dimension (1 point per box)
+
                 sparse_embeddings, dense_embeddings = self.prompt_encoder(
-                    points=None,
-                    boxes=bbox,
+                    points= point_and_label if self.cfg.use_points else None, 
+                    boxes=bbox if self.cfg.use_bboxes else None,
                     masks=None,
                 )
 

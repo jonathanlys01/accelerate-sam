@@ -80,7 +80,7 @@ def load_datasets(cfg):
     val_loader = DataLoader(val, batch_size=cfg.batch_size, shuffle=True, num_workers=cfg.num_workers)
     return train_loader, val_loader
 
-class EmbedDatasets(Dataset):
+class EmbedDataset(Dataset):
     def __init__(self, root_dir, annotation_file):
         self.root_dir = root_dir #root dir refers to the embeddings folder
         self.coco = COCO(annotation_file)
@@ -122,9 +122,9 @@ class EmbedDatasets(Dataset):
         masks = []
         classes = []
 
-        # Use only 5 annotations per image
-        if len(anns) > 5:
-            anns = rd.sample(anns, 5)
+        # Use only cfg.nb_annot annotations per image
+        if len(anns) > cfg.nb_annot:
+            anns = rd.sample(anns, cfg.nb_annot)
         for ann in anns:
             x, y, w, h = ann['bbox']
             class_id = ann['category_id']
@@ -165,21 +165,27 @@ class EmbedDatasets(Dataset):
 
         # end resize and pad
 
+        
+        points = [get_center_of_mass(mask) for mask in masks] # center of mass
+
+        #points = [((bbox[0]+bbox[2])/2, (bbox[1]+bbox[3])/2) for bbox in bboxes] # center of bbox
+
+        points = np.stack(points, axis=0)
         bboxes = np.stack(bboxes, axis=0)
         masks = np.stack(masks, axis=0)
         classes = np.stack(classes, axis=0)
 
-        return embed, torch.tensor(bboxes), torch.tensor(masks).float(), torch.tensor(classes)
+        return embed, torch.tensor(bboxes), torch.tensor(masks).float(), torch.tensor(classes), torch.tensor(points)
 
 def collate_fn(batch):
-    embeddings, bboxes, masks, classes = zip(*batch)
+    embeddings, bboxes, masks, classes, points = zip(*batch)
     embeddings = torch.stack(embeddings)
-    return embeddings, bboxes, masks, classes
+    return embeddings, bboxes, masks, classes, points
 
 def load_embed_datasets(cfg):
-    train = EmbedDatasets(root_dir=cfg.dataset.train.embedding_dir,  
+    train = EmbedDataset(root_dir=cfg.dataset.train.embedding_dir,  
                         annotation_file=cfg.dataset.train.annotation_file)
-    val = EmbedDatasets(root_dir=cfg.dataset.val.embedding_dir,
+    val = EmbedDataset(root_dir=cfg.dataset.val.embedding_dir,
                         annotation_file=cfg.dataset.val.annotation_file)
 
     train_loader = DataLoader(train, 
@@ -193,3 +199,13 @@ def load_embed_datasets(cfg):
                             num_workers=cfg.num_workers, 
                             collate_fn=collate_fn)
     return train_loader, val_loader
+
+def extract_point(mask):
+    # for now, center of mass
+    # todo: adapt for non convex shapes
+    return torch.tensor(get_center_of_mass(mask))
+
+def get_center_of_mass(mask):
+    l_x, l_y = np.where(mask == 1)
+    return np.mean(l_x), np.mean(l_y)
+    
