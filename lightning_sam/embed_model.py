@@ -39,6 +39,8 @@ class TopModel(nn.Module):
     # lol
     def __init__(self, cfg):
         super().__init__()
+        self.prompt_encoder = None
+        self.mask_decoder = None
         self.cfg = cfg
         self.setup()
 
@@ -64,15 +66,15 @@ class TopModel(nn.Module):
         pred_masks = []
         ious = []
         for embedding, bbox, point in zip(image_embeddings, bboxes, points):
-            with torch.inference_mode():           
-                point_and_label = (point.unsqueeze(1),
-                                   torch.tensor(1,device=point.device).repeat(point.shape[0]).unsqueeze(1)) # add a dimension in the second dimension (1 point per box)
+            #with torch.inference_mode(): # remove this line if the prompt encoder is trained          
+            point_and_label = (point.unsqueeze(1),
+                                torch.tensor(1,device=point.device).repeat(point.shape[0]).unsqueeze(1)) # add a dimension in the second dimension (1 point per box)
 
-                sparse_embeddings, dense_embeddings = self.prompt_encoder(
-                    points= point_and_label if self.cfg.use_points else None, 
-                    boxes=bbox if self.cfg.use_bboxes else None,
-                    masks=None,
-                )
+            sparse_embeddings, dense_embeddings = self.prompt_encoder(
+                points= point_and_label if self.cfg.use_points else None, 
+                boxes=bbox if self.cfg.use_bboxes else None,
+                masks=None,
+            )
 
             # outside of inference mode, mask decoder needs to be in training mode
             low_res_masks, iou_predictions = self.mask_decoder(

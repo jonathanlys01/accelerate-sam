@@ -11,6 +11,10 @@ from torch.utils.data import Dataset
 
 import random as rd
 
+from config import cfg
+
+is_coco = cfg.dataset.is_coco # True if dataset is coco, False if dataset is LVIS
+
 class COCODataset(Dataset):
 
     def __init__(self, root_dir, annotation_file, transform=None):
@@ -25,7 +29,10 @@ class COCODataset(Dataset):
         temp = os.listdir(self.root_dir)
         for image_id in tqdm(list(self.coco.imgs.keys())):
             image_info = self.coco.loadImgs(image_id)[0]
-            name = image_info['coco_url'].split('/')[-1]
+            if is_coco:
+                name = image_info['file_name']
+            else:
+                name = image_info['coco_url'].split('/')[-1]
             if name in temp and len(self.coco.getAnnIds(imgIds=image_id)) > 0:
                 self.image_ids.append(image_id)
         print("Total images:",len(self.image_ids))
@@ -37,7 +44,10 @@ class COCODataset(Dataset):
         image_id = self.image_ids[idx]
         image_info = self.coco.loadImgs(image_id)[0]
 
-        name = image_info['coco_url'].split('/')[-1]
+        if is_coco:
+            name = image_info['file_name']
+        else:
+            name = image_info['coco_url'].split('/')[-1]
         #image_path = os.path.join(self.root_dir, image_info['file_name'])
         
         image_path = os.path.join(self.root_dir, name)
@@ -53,8 +63,8 @@ class COCODataset(Dataset):
         classes = []
 
         # Use only 5 annotations per image
-        if len(anns) > 5:
-            anns = rd.sample(anns, 5)
+        if len(anns) > cfg.nb_annot:
+            anns = rd.sample(anns, cfg.nb_annot)
         for ann in anns:
             x, y, w, h = ann['bbox']
             class_id = ann['category_id']

@@ -28,18 +28,35 @@ from utils import calc_iou
 from tqdm import tqdm
 import numpy as np
 
+import matplotlib.pyplot as plt
+
 torch.set_float32_matmul_precision('high')
 
 
-def calc_iou_single(pred_mask: np.ndarray, gt_mask: torch.Tensor):
+def calc_iou_single(pred_mask: torch.Tensor, gt_mask: torch.Tensor):
     # when using automatic mask generator, the output is already a mask
     # clip the values to 0 and 1
-    pred_mask = torch.from_numpy(pred_mask).float()
+    pred_mask = (pred_mask >= 0.5).float()
     union = torch.clamp(pred_mask + gt_mask, 0, 1).sum()
     intersection = (pred_mask * gt_mask).sum()
     epsilon = 1e-7
     iou = (intersection + epsilon) / (union + epsilon)
     return iou
+
+def show_anns(anns,ax):
+    if len(anns) == 0:
+        return
+    sorted_anns = sorted(anns, key=(lambda x: x['area']), reverse=True)
+    ax = plt.gca()
+    ax.set_autoscale_on(False)
+
+    img = np.ones((sorted_anns[0]['segmentation'].shape[0], sorted_anns[0]['segmentation'].shape[1], 4))
+    img[:,:,3] = 0
+    for ann in sorted_anns:
+        m = ann['segmentation']
+        color_mask = np.concatenate([np.random.random(3), [0.35]])
+        img[m] = color_mask
+    ax.imshow(img)
 
 def validate(cfg : Box,
              accelerator: Accelerator, 
@@ -57,9 +74,11 @@ def validate(cfg : Box,
             
             for image, _ , gt_masks in zip(batch_images, batch_bboxes, batch_gt_masks): # bbox not used
 
-                image_numpy = image.cpu().numpy().transpose(1,2,0).astype(np.uint8) # HWC to CHW
+                image_numpy = (255*image).cpu().numpy().transpose(1,2,0).astype(np.uint8) # HWC to CHW # !!!! multiply by 255
                 outputs = MG.generate(image_numpy)
+
                 pred_masks = [output['segmentation'] for output in outputs]
+
                 gt_masks = gt_masks.cpu()
 
                 if len(pred_masks) == 0:
@@ -110,7 +129,7 @@ def compute_iou_avg(dict_ious : dict):
     return np.mean(all_concat)
     #return np.mean(map(lambda x: float(x.cpu()), all_concat))
 
-
+# TO DO : edit validate_per_class
 def validate_per_class(cfg : Box,
              accelerator: Accelerator, 
              MG: SamAutomaticMaskGenerator, 
@@ -200,21 +219,45 @@ def train_sam(
             with accelerator.accumulate(model):
                 
                 data_time.update(time.time() - end)
-                images, bboxes, gt_masks, _ = data # classes are not used in normal training
-                batch_size = images.size(0)
-                pred_masks, iou_predictions = model(images, bboxes)
-                num_masks = sum(len(pred_mask) for pred_mask in pred_masks)
-            
-                loss_focal = torch.tensor(0., device=accelerator.device)
-                loss_dice = torch.tensor(0., device=accelerator.device)
-                loss_iou = torch.tensor(0., device=accelerator.device)
-                for pred_mask, gt_mask, iou_prediction in zip(pred_masks, gt_masks, iou_predictions):
-                    batch_iou = calc_iou(pred_mask, gt_mask)
-                    loss_focal += focal_loss(pred_mask, gt_mask, num_masks)
-                    loss_dice += dice_loss(pred_mask, gt_mask, num_masks)
-                    loss_iou += F.mse_loss(iou_prediction, batch_iou, reduction='sum') / num_masks # useful? 
+                batch_images, batch_bboxes, batch_gt_masks, _ = data # classes not used 
 
-                loss_total = 20. * loss_focal + loss_dice + loss_iou
+                for image, _, gt_masks in zip(batch_images, batch_bboxes, batch_gt_masks): # 1 image at a time (automatic mask predictor limitation)
+
+                    image_numpy = (255*image).cpu().numpy().transpose(1,2,0).astype(np.uint8) # HWC to CHW # !!!! multiply by 255
+                    outputs = MG.generate(image_numpy)
+
+                    pred_masks = torch.from_numpy(np.array([output['segmentation'].astype(float) for output in outputs])).to(accelerator.device)
+
+                    pred_iou = torch.from_numpy(np.array([output['predicted_iou'] for output in outputs])).to(accelerator.device)
+                    
+                    if len(pred_masks) == 0:
+                        print("No masks found")
+                        continue
+
+                    filtered_pred_masks = filter_masks(pred_masks,gt_masks)
+
+                    if len(filtered_pred_masks) != len(gt_masks):
+                        print(f"Filtered pred masks: {len(filtered_pred_masks)}")
+                        print(f"GT masks: {len(gt_masks)}")
+                        print("Skipping this image")
+                        continue
+                    
+                    batch_size = 1
+                
+                    num_masks = sum(len(pred_mask) for pred_mask in filtered_pred_masks)
+            
+                    loss_focal = torch.tensor(0., device=accelerator.device)
+                    loss_dice = torch.tensor(0., device=accelerator.device)
+                    loss_iou = torch.tensor(0., device=accelerator.device)
+
+                    for pred_mask, gt_mask, iou_prediction in zip(filtered_pred_masks, gt_masks, pred_iou):
+                        pred_mask = torch.tensor(pred_mask, device=accelerator.device)
+                        batch_iou = calc_iou_single(pred_mask, gt_mask)
+                        loss_focal += focal_loss(pred_mask, gt_mask, num_masks)
+                        loss_dice += dice_loss(pred_mask, gt_mask, num_masks)
+                        loss_iou += F.mse_loss(iou_prediction, batch_iou, reduction='sum') / num_masks # useful? 
+
+                    loss_total = 20. * loss_focal + loss_dice + loss_iou
 
                 accelerator.backward(loss_total)
                 optimizer.step()
@@ -281,9 +324,22 @@ def main(cfg: Box, accelerator: Accelerator) -> None:
 
     sam_model = sam_model_registry[cfg.model.type](checkpoint=cfg.model.checkpoint)
 
+    """path = "/home/someone/stage_jonathan/lightning-sam/lightning-sam/lightning_sam/out/training/mask_decoder1_epochs.pth" # 1 epochs -1 = 0 (modele original)
+
+    path = "/home/someone/stage_jonathan/lightning-sam/lightning-sam/lightning_sam/out/training/mask_decoder2_epochs.pth"
+    
+
+    new_mask_decoder = torch.load(path,) # map_location=torch.device('cpu'))
+
+    sam_model.mask_decoder.load_state_dict(new_mask_decoder)
+
+    del new_mask_decoder"""
+
     sam_model = setup_sam(sam_model,cfg)
 
-    model = SamAutomaticMaskGenerator(sam_model)
+
+    model = SamAutomaticMaskGenerator(model=sam_model)
+
 
     model.predictor.model.to(accelerator.device)
     
@@ -295,16 +351,13 @@ def main(cfg: Box, accelerator: Accelerator) -> None:
         train_data, val_data, model, optimizer, scheduler
     )
 
-    print("First validation...")
-    validate(cfg, accelerator, model, val_data, epoch=0)
-    
-    exit() # only validate for now
-    validate_per_class(cfg, accelerator, model, val_data, epoch=0)
+
     print("Training...")
     train_sam(cfg, accelerator, model, optimizer, scheduler, train_data, val_data)
     print("Validating...")
-    #validate(cfg,accelerator, model, val_data, epoch=cfg.num_epochs)
-    validate_per_class(cfg, accelerator, model, val_data, epoch=cfg.num_epochs)
+    validate(cfg,accelerator, model, val_data, epoch=cfg.num_epochs)
+    torch.save(model.predictor.model.mask_decoder.state_dict(), os.path.join(cfg.out_dir, 'mask_decoder_train_AMG.pth'))
+
 
 
 def select_mask_from_label(pred_masks, gt_mask):

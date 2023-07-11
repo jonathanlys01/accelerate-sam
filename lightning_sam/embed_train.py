@@ -184,21 +184,21 @@ def train_sam(
 
                 embedings, bboxes, gt_masks, _, points = data # classes are not used in normal validation 
                 batch_size = cfg.batch_size
-                with torch.cuda.amp.autocast(): # mixed precision
-                    pred_masks, iou_predictions = model(embedings, bboxes, points)
+                #with torch.cuda.amp.autocast(): # mixed precision
+                pred_masks, iou_predictions = model(embedings, bboxes, points)
 
-                    num_masks = sum(len(pred_mask) for pred_mask in pred_masks)
-                
-                    loss_focal = torch.tensor(0., device=accelerator.device)
-                    loss_dice = torch.tensor(0., device=accelerator.device)
-                    loss_iou = torch.tensor(0., device=accelerator.device)
-                    for pred_mask, gt_mask, iou_prediction in zip(pred_masks, gt_masks, iou_predictions):
-                        batch_iou = calc_iou(pred_mask, gt_mask)
-                        loss_focal += focal_loss(pred_mask, gt_mask, num_masks)
-                        loss_dice += dice_loss(pred_mask, gt_mask, num_masks)
-                        loss_iou += F.mse_loss(iou_prediction, batch_iou, reduction='sum') / num_masks # useful? 
+                num_masks = sum(len(pred_mask) for pred_mask in pred_masks)
+            
+                loss_focal = torch.tensor(0., device=accelerator.device)
+                loss_dice = torch.tensor(0., device=accelerator.device)
+                loss_iou = torch.tensor(0., device=accelerator.device)
+                for pred_mask, gt_mask, iou_prediction in zip(pred_masks, gt_masks, iou_predictions):
+                    batch_iou = calc_iou(pred_mask, gt_mask)
+                    loss_focal += focal_loss(pred_mask, gt_mask, num_masks)
+                    loss_dice += dice_loss(pred_mask, gt_mask, num_masks)
+                    loss_iou += F.mse_loss(iou_prediction, batch_iou, reduction='sum') / num_masks # useful? 
 
-                    loss_total = loss_focal + loss_dice + loss_iou
+                loss_total = 20.0*loss_focal + loss_dice + loss_iou
 
                 accelerator.backward(loss_total)
                 optimizer.step()
@@ -272,6 +272,9 @@ def main(cfg: Box, accelerator: Accelerator) -> None:
     print("Last validation")
     #validate(cfg,accelerator, model, val_data, epoch=cfg.num_epochs)
     validate_per_class(cfg, accelerator, model, val_data, epoch=cfg.num_epochs)
+
+    if accelerator.is_main_process:
+        torch.save(model.mask_decoder.state_dict(), os.path.join(cfg.out_dir, f"mask_decoder{cfg.num_epochs}_epochs.pth"))
 
 
 if __name__ == "__main__":
