@@ -3,7 +3,8 @@ from embed_model import EncoderModel
 from tqdm import tqdm
 import torch
 from config import cfg
-from embed_dataset import load_datasets
+#from embed_dataset import load_datasets
+from embed_skin_dataset import load_skin_datasets
 import os
 
 
@@ -33,7 +34,7 @@ def main(cfg):
     model = EncoderModel(cfg)
     model.to("cuda")
     print("Model loaded! Check nvidia-smi for memory usage.")
-    train_data, val_data = load_datasets(cfg)
+    train_data, val_data = load_skin_datasets(cfg)
 
     generate_embeddings(model,val_data,cfg.dataset.val.embedding_dir)
 
