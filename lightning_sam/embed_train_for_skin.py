@@ -169,24 +169,10 @@ def train_sam(
 
 
                 for pred_mask, gt_mask, iou_prediction in zip(pred_masks, gt_masks, iou_predictions):
-                    gt_mask = gt_mask.float()
-                    temp_iou = calc_iou(pred_mask, gt_mask)
-                    if all(iou != float('nan') for iou in temp_iou[0]):
-                        batch_iou = temp_iou
-                    else:
-                        batch_iou = torch.tensor(0., device=accelerator.device)
-                        print("iou is nan")
-                    temp_focal = focal_loss(pred_mask, gt_mask, num_masks)
-                    if temp_focal.cpu().detach().numpy() != np.nan:
-                        loss_focal += temp_focal
-                    else:
-                        print("focal is nan")
-                    temp_dice = dice_loss(pred_mask, gt_mask, num_masks)
-                    if temp_dice.cpu().detach().numpy() != np.nan:
-                        loss_dice += temp_dice
-                    else:
-                        print("dice is nan")
-
+                    gt_mask = gt_mask.float()                  
+                    batch_iou = calc_iou(pred_mask, gt_mask)
+                    loss_focal += focal_loss(pred_mask, gt_mask, num_masks)
+                    loss_dice += dice_loss(pred_mask, gt_mask, num_masks)
                     loss_iou += F.mse_loss(iou_prediction, batch_iou, reduction='sum') / num_masks # useful? 
 
                 loss_total = 20.0*loss_focal + loss_dice + loss_iou
