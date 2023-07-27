@@ -107,7 +107,7 @@ def validate_per_class(cfg : Box,
     dict_ious = {id: [] for id in dict_classes.keys()}
 
     with torch.inference_mode():
-        for iter, data in enumerate(val_dataloader):
+        for iter, data in tqdm(enumerate(val_dataloader),total=len(val_dataloader)):
             images, bboxes, gt_masks, classes = data
             num_images = images.size(0)
             pred_masks, _ = model(images, bboxes)
@@ -230,7 +230,24 @@ def configure_opt(cfg: Box, model: Model):
         else:
             return 1 / (cfg.opt.decay_factor**2)
 
-    optimizer = torch.optim.Adam(model.model.parameters(), lr=cfg.opt.learning_rate, weight_decay=cfg.opt.weight_decay)
+    params = [{'params': model.model.prompt_encoder.parameters()}] + [{'params': model.model.mask_decoder.parameters()}] + [{'params': model.model.image_encoder.neck.parameters()}]
+
+
+
+    params += [{'params': model.adapt_params}] 
+
+    # don't forget the layer norm parameters
+
+    blocks_ids = [i for i, r in enumerate(model.ranks) if r > 0]
+
+    params += [{'params': model.model.image_encoder.blocks[i].norm1.parameters()} for i in blocks_ids]
+    params += [{'params': model.model.image_encoder.blocks[i].norm2.parameters()} for i in blocks_ids]
+
+    # params are the parameters of the mask decoder, prompt encoder, image encoder neck and adapt_params
+    # adapt params are the params of the spm and the lora layers
+
+    optimizer = torch.optim.Adam(params,
+                                 lr=cfg.opt.learning_rate, weight_decay=cfg.opt.weight_decay)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     return optimizer, scheduler
@@ -244,9 +261,10 @@ def main(cfg: Box, accelerator: Accelerator) -> None:
     if accelerator.is_main_process:
         os.makedirs(cfg.out_dir, exist_ok=True)
 
-    
-    model = Model(cfg)
-    model.setup() # require_grad=False for backbone
+    ranks = (-1,)*(32-4)+(4,)*4
+    #ranks = (-1,)*32
+    model = Model(cfg, ranks)
+    model.setup() 
 
     train_data, val_data = load_datasets(cfg, model.model.image_encoder.img_size)
 

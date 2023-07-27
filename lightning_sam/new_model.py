@@ -1,20 +1,43 @@
 import torch.nn as nn
 import torch.nn.functional as F
 import torch
-from segment_anything import sam_model_registry
+from segment_anything_adapt import custom_sam_model_registry
 from segment_anything import SamPredictor
 
 
 class Model(nn.Module):
 
-    def __init__(self, cfg):
+    def __init__(self, cfg, ranks):
         super().__init__()
         self.cfg = cfg
+        self.adapt_params = None
+
+        self.ranks = ranks
 
     def setup(self):
-        self.model = sam_model_registry[self.cfg.model.type](checkpoint=self.cfg.model.checkpoint)
+
+
+        last_frozen = max([i for i, r in enumerate(self.ranks) if r == -1]) # index of the last frozen layer
+
+        self.model, self.adapt_params = custom_sam_model_registry[self.cfg.model.type](checkpoint=self.cfg.model.checkpoint, ranks=self.ranks)
         self.model.train()
-        if self.cfg.model.freeze.image_encoder:
+
+        for param in self.model.parameters():
+            param.requires_grad = True
+
+        for param in self.model.image_encoder.patch_embed.parameters():
+            param.requires_grad = False
+        
+        for name, module in self.model.image_encoder.blocks.named_children():
+            if int(name) <= last_frozen:
+                for param in module.parameters():
+                    param.requires_grad = False
+
+        for param in self.model.prompt_encoder.parameters():
+            param.requires_grad = False
+
+
+        """if self.cfg.model.freeze.image_encoder:
             for param in self.model.image_encoder.parameters():
                 param.requires_grad = False
         if self.cfg.model.freeze.prompt_encoder:
@@ -22,14 +45,14 @@ class Model(nn.Module):
                 param.requires_grad = False
         if self.cfg.model.freeze.mask_decoder:
             for param in self.model.mask_decoder.parameters():
-                param.requires_grad = False
+                param.requires_grad = False"""
 
     def forward(self, images, bboxes):
         _, _, H, W = images.shape
         """"Inference mode is used on the image encoder and prompt encoder"""
         # Here
-        with torch.inference_mode():
-            image_embeddings = self.model.image_encoder(images)
+        #with torch.inference_mode():
+        image_embeddings = self.model.image_encoder(images)
 
         pred_masks = []
         ious = []

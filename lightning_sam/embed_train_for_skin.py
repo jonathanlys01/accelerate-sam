@@ -68,7 +68,9 @@ def validate_per_class(cfg : Box,
 
             gt_masks = gt_masks.unsqueeze(0)
             bboxes = bboxes.unsqueeze(0)
-            points = points.unsqueeze(0)
+            points = points.unsqueeze(0) #only when using a single point
+
+            
 
                 
             batch_size = cfg.batch_size
@@ -78,7 +80,7 @@ def validate_per_class(cfg : Box,
             pred_masks, iou_predictions = model(embeds, bboxes, points)
 
 
-            # refaire
+
             for pred_mask, gt_mask, id in zip(pred_masks[0], gt_masks[0], classes):
                 
                 # pred mask represents several masks for 1 given image
@@ -88,7 +90,7 @@ def validate_per_class(cfg : Box,
                 iou = calc_iou_single(pred_mask, gt_mask)
                 id = int(id.detach().cpu().numpy())
                 dict_ious[id].append(iou)
-
+            #print(list((key,len(dict_ious[key])) for key in dict_ious.keys()))
             if iter % cfg.val_log_interval == 0:
                 iou_avg = compute_iou_avg(dict_ious)
                  
@@ -131,6 +133,22 @@ def train_sam(
     dice_loss = DiceLoss()
 
     for epoch in range(1, cfg.num_epochs):
+
+        """if 0 <= epoch < int(cfg.num_epochs*0.5):
+            cfg.use_points = False
+            cfg.use_bboxes = True
+            model.cfg = cfg
+        
+        if int(cfg.num_epochs*0.5) <= epoch < int(cfg.num_epochs*0.8):
+            cfg.use_points = True
+            cfg.use_bboxes = True
+            model.cfg = cfg
+            
+        if  int(cfg.num_epochs*0.8)<= epoch < cfg.num_epochs:
+            cfg.use_bboxes = False
+            cfg.use_points = True
+            model.cfg = cfg"""
+
         batch_time = AverageMeter()
         data_time = AverageMeter()
         focal_losses = AverageMeter()
@@ -218,6 +236,8 @@ def configure_opt(cfg: Box, model: TopModel):
     return optimizer, scheduler
 
 
+import datetime
+
 def main(cfg: Box, accelerator: Accelerator) -> None:
 
 
@@ -229,8 +249,18 @@ def main(cfg: Box, accelerator: Accelerator) -> None:
     
     model = TopModel(cfg)
 
-    print("Model loaded")
+    print("og Model loaded")
     #model.setup() # not required because already done in __init__
+
+    model.mask_decoder.load_state_dict(torch.load("/home/someone/stage_jonathan/lightning-sam/lightning-sam/lightning_sam/out/training/mask_decoder20_epochs_HAM10000_train_2023-07-24_19:56:55.pth"))
+    print("Resuming training")
+
+    for module in model.mask_decoder.named_children():
+        if module[0] in ["output_upscaling","output_hypernetworks_mlps","iou_prediction_head"]:
+            print(f"Freezing {module[0]}")
+            for param in module[1].parameters():
+                param.requires_grad = True
+
 
 
     train_data, val_data = load_embed_datasets(cfg)
@@ -242,7 +272,7 @@ def main(cfg: Box, accelerator: Accelerator) -> None:
     )
 
     print("First validation")
-    validate_per_class(cfg, accelerator, model, val_data, epoch=0)
+    #validate_per_class(cfg, accelerator, model, val_data, epoch=0)
 
     print("Training")
     train_sam(cfg, accelerator, model, optimizer, scheduler, train_data, val_data)
@@ -250,7 +280,8 @@ def main(cfg: Box, accelerator: Accelerator) -> None:
     validate_per_class(cfg, accelerator, model, val_data, epoch=cfg.num_epochs)
 
     if accelerator.is_main_process and cfg.save_last:
-        torch.save(model.mask_decoder.state_dict(), os.path.join(cfg.out_dir, f"mask_decoder{cfg.num_epochs}_epochs_{cfg.dataset.train.root_dir.split('/')[-2]}.pth"))
+        date = datetime.datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
+        torch.save(model.mask_decoder.state_dict(), os.path.join(cfg.out_dir, f"mask_decoder{cfg.num_epochs}_epochs_{cfg.dataset.train.root_dir.split('/')[-2]}_{date}.pth"))
 
 
 if __name__ == "__main__":

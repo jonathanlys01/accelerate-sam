@@ -218,9 +218,32 @@ def load_embed_datasets(cfg):
 def extract_point(mask):
     # for now, center of mass
     # todo: adapt for non convex shapes
-    return torch.tensor(get_center_of_mass(mask))
+    x,y = get_center_of_mass(mask)
+
+    # image is 1024x1024
+
+    """xr = round(x/32) * 32
+    yr = round(y/32) * 32
+
+    return torch.tensor(((xr+x)/2,(yr+y)/2) )"""
+
+    return torch.tensor((x,y))
+
+
+"""
+    # nearest point on the 32x32 grid
+
+    x,y = get_center_of_mass(mask)
+
+    # image is 1024x1024
+
+    xr = round(x/32) * 32
+    yr = round(y/32) * 32
+
+    return torch.tensor((xr,yr))
+"""
 
 def get_center_of_mass(mask):
-    l_x, l_y = np.where(mask == 1)
+    l_y, l_x = np.where(mask == 1) #  terrible
     return np.mean(l_x), np.mean(l_y)
     
