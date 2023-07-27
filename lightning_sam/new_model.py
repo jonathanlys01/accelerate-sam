@@ -36,6 +36,10 @@ class Model(nn.Module):
         for param in self.model.prompt_encoder.parameters():
             param.requires_grad = False
 
+        # gradient performed on: 
+        # the mask decoder
+        # the last frozen layers of the image encoder
+
 
         """if self.cfg.model.freeze.image_encoder:
             for param in self.model.image_encoder.parameters():

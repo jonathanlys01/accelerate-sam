@@ -5,6 +5,13 @@ Replace the lightning module with Accelerate (HuggingFace)
 import os
 import time
 
+import sys
+path = '/nasbrain/f21lin/venv/venvDuSchlag/lib/python3.10/site-packages'
+
+if not path in sys.path:
+    sys.path.append(path)
+    print("Added path to sys.path")
+
 """import lightning as L
 from lightning.fabric.fabric import _FabricOptimizer
 from lightning.fabric.loggers import TensorBoardLogger"""
@@ -261,9 +268,7 @@ def main(cfg: Box, accelerator: Accelerator) -> None:
     if accelerator.is_main_process:
         os.makedirs(cfg.out_dir, exist_ok=True)
 
-    ranks = (-1,)*(32-4)+(4,)*4
-    #ranks = (-1,)*32
-    model = Model(cfg, ranks)
+    model = Model(cfg, cfg.model.ranks)
     model.setup() 
 
     train_data, val_data = load_datasets(cfg, model.model.image_encoder.img_size)

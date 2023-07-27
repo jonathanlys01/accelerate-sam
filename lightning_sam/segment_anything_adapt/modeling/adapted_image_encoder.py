@@ -56,7 +56,7 @@ class AdaptedImageEncoderViT(nn.Module):
         self.window_size = window_size
         self.global_attn_indexes = global_attn_indexes
 
-        assert len(ranks) == depth, "Number of ranks must match the depth of the network." # format: (-1,-1,...,4,4), if -1, then use normal non biased attention
+        assert len(ranks) == depth, f"Number of ranks must match the depth of the network., got {len(ranks)}, excpected {depth}" # format: (-1,-1,...,4,4), if -1, then use normal non biased attention
 
         self.patch_embed = PatchEmbed(
             kernel_size=(patch_size, patch_size),

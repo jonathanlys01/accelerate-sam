@@ -109,8 +109,10 @@ def _build_sam(
 
     adapt_params = []
     if checkpoint is not None:
+        print("Loading checkpoint")
         with open(checkpoint, "rb") as f:
             state_dict = torch.load(f, map_location=torch.device("cuda"))
+        print("Loaded state dict")
         
         # only load the weights that are in the state dict, the others will be initialized randomly
         for name, param in sam.named_parameters():
